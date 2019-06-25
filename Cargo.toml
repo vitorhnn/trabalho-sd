@@ -10,4 +10,5 @@ serde = { version = "1.0", features = ["derive"] }
 bincode = "1.1.4"
 env_logger = "0.6.1"
 log = "0.4.6"
+socket2 = "0.3.9"
 
