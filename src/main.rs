@@ -3,7 +3,7 @@ use std::io;
 use std::net::{Ipv4Addr, UdpSocket, SocketAddr, ToSocketAddrs};
 use std::str;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -21,7 +21,10 @@ enum Message {
     FindLeader,
     AnswerLeader { id: u64 },
     CallElection { id: u64  },
-    AnswerElection { id: u64 }
+    AnswerElection { id: u64 },
+    LeaderSendTime { time: u64 },
+    FollowerSendDiff { diff: u64 },
+    LeaderSendDisplacement { displacement: u64 }
 }
 
 #[derive(Debug)]
@@ -187,7 +190,8 @@ impl BullyState for RunLeaderLogic {
 
                     let answer_msg = Message::AnswerLeader { id: self.shared_state.id };
                     send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &answer_msg)?;
-                }
+                },
+                Message::AnswerLeader { id: message_id} if message_id == self.shared_state.id => {},
                 _ => panic!("I don't want to deal with this right now: {:?}", deserialized_msg)
             }
         }
@@ -200,7 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut rng = thread_rng();
     let self_id: u64 = rng.gen();
     let extra_delay = rng.gen_range(0, 1000);
-    let time = Arc::new(AtomicUsize::new(1));
+    let time = Arc::new(AtomicU64::new(1));
 
     let time_clone = time.clone();
 
