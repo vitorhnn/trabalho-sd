@@ -46,6 +46,7 @@ struct SharedState {
     id: u64,
     socket: UdpSocket,
     rng: ThreadRng,
+    time: Arc<AtomicU64>
 }
 
 trait BullyState {
@@ -166,33 +167,75 @@ struct RunLeaderLogic {
 impl BullyState for RunLeaderLogic {
     fn execute(self: Box<Self>) -> Result<Box<BullyState>, Box<Error>> {
         info!("running leader logic");
+        self.shared_state.socket.set_read_timeout(Some(Duration::from_secs(10)))?;
 
         loop {
             let mut buf = [0; 512];
 
-            let bytes_received = self.shared_state.socket.recv(&mut buf)?;
+            match self.shared_state.socket.recv(&mut buf) {
+                Ok(bytes_received) => {
+                    let deserialized_msg: Message = deserialize(&buf[..bytes_received])?;
 
-            let deserialized_msg: Message = deserialize(&buf[..bytes_received])?;
+                    match deserialized_msg {
+                        Message::CallElection { id: message_id } => {
+                            info!("received election call, id {}", message_id);
 
-            match deserialized_msg {
-                Message::CallElection { id: message_id } => {
-                    info!("received election call, id {}", message_id);
+                            if message_id < self.shared_state.id {
+                                let answer_election_msg = Message::AnswerElection { id: self.shared_state.id };
+                                send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &answer_election_msg)?;
+                            }
 
-                    if message_id < self.shared_state.id {
-                        let answer_election_msg = Message::AnswerElection { id: self.shared_state.id };
-                        send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &answer_election_msg)?;
+                            return Ok(Box::new(UnknownLeader { shared_state: self.shared_state }))
+                        },
+                        Message::FindLeader => {
+                            info!("received AskLeader");
+
+                            let answer_msg = Message::AnswerLeader { id: self.shared_state.id };
+                            send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &answer_msg)?;
+                        },
+                        Message::AnswerLeader { id: message_id} if message_id == self.shared_state.id => {},
+                        _ => panic!("I don't want to deal with this right now: {:?}", deserialized_msg)
+                    }
+                },
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                    // nothing received, send berkeley's sync stuff
+                    let clock_msg = Message::LeaderSendTime { time: self.shared_state.time.load(Ordering::SeqCst) };
+                    send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &clock_msg)?;
+
+                    thread::sleep(Duration::from_secs(3));
+
+                    self.shared_state.socket.set_nonblocking(true)?;
+
+                    let mut buf = [0; 512];
+                    let mut msgs = Vec::new();
+
+                    loop {
+                        match self.shared_state.socket.recv(&mut buf) {
+                            Ok(n) => {
+                                let deserialized_msg: Message = deserialize(&buf[..n])?;
+
+                                match deserialized_msg {
+                                    Message::FollowerSendDiff { diff } => msgs.push(diff),
+                                    _ => panic!("isso não deveria ter sido recebido agora: {:?}", deserialized_msg)
+                                }
+                            },
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            _ => panic!("error while looping for time diffs")
+                        }
                     }
 
-                    return Ok(Box::new(UnknownLeader { shared_state: self.shared_state }))
-                },
-                Message::FindLeader => {
-                    info!("received AskLeader");
+                    self.shared_state.socket.set_nonblocking(false)?;
 
-                    let answer_msg = Message::AnswerLeader { id: self.shared_state.id };
-                    send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &answer_msg)?;
+                    let sum: u64 = msgs
+                        .iter()
+                        .sum();
+
+                    let avg = sum / msgs.len() as u64;
+
+                    let displace_msg = Message::LeaderSendDisplacement { displacement: avg };
+                    send_message(&self.shared_state.socket, &(MULTICAST_ADDR, 6000), &displace_msg)?;
                 },
-                Message::AnswerLeader { id: message_id} if message_id == self.shared_state.id => {},
-                _ => panic!("I don't want to deal with this right now: {:?}", deserialized_msg)
+                Err(e) => return Err(Box::new(e)),
             }
         }
     }
@@ -230,7 +273,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let socket: UdpSocket = socket.into();
 
-    let shared_state = SharedState { socket, id: self_id, rng };
+    let shared_state = SharedState { socket, id: self_id, rng, time };
 
     let mut process_state: Box<dyn BullyState> = Box::new(AskForLeader { shared_state });
 
